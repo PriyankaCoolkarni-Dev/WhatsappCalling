@@ -30,6 +30,12 @@ app.post('/webhook', validateSignature, (req, res) => {
   handleWebhookEvent(req, res, callManager, io);
 });
 
+// Forwarded webhook from n8n (no Meta signature - n8n already validated)
+app.post('/webhook/forward', (req, res) => {
+  console.log('[Webhook] Received forwarded event from n8n');
+  handleWebhookEvent(req, res, callManager, io);
+});
+
 // ── API routes ──
 
 app.post('/api/enable-calling', async (req, res) => {
