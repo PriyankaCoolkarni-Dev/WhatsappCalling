@@ -51,6 +51,12 @@ function handleWebhookEvent(req, res, callManager, io) {
         for (const call of calls) {
           processCallEvent(call, callManager, io);
         }
+
+        // Call status updates come in statuses array (RINGING, ACCEPTED, etc.)
+        const callStatuses = change.value?.statuses || [];
+        for (const status of callStatuses) {
+          processCallStatusEvent(status, callManager, io);
+        }
       }
 
       if (change.field === 'messages') {
@@ -93,6 +99,27 @@ function processCallEvent(call, callManager, io) {
 
     default:
       console.log(`[Call Event] Unknown event: ${event}`);
+  }
+}
+
+function processCallStatusEvent(status, callManager, io) {
+  const callId = status.id;
+  const statusValue = status.status;
+  console.log(`[Call Status] id=${callId} status=${statusValue}`);
+
+  switch (statusValue) {
+    case 'RINGING':
+      callManager.handleOutboundStatus(callId, 'ringing', io);
+      break;
+    case 'ACCEPTED':
+      callManager.handleOutboundStatus(callId, 'accepted', io);
+      break;
+    case 'REJECTED':
+      callManager.handleOutboundStatus(callId, 'rejected', io);
+      break;
+    default:
+      console.log(`[Call Status] Unknown status: ${statusValue}`);
+      io.emit('call-status', { callId, status: statusValue });
   }
 }
 

@@ -79,7 +79,8 @@ async function startOutboundCallWithServerWebRTC(phone, io) {
 
   // Send to WhatsApp via Graph API
   const result = await whatsappApi.initiateOutboundCall(phone, sdpOffer);
-  const callId = result.call_id || result.id || `call_${Date.now()}`;
+  // API returns { calls: [{ id: "wacid..." }], success: true }
+  const callId = result.calls?.[0]?.id || result.call_id || result.id || `call_${Date.now()}`;
 
   const state = {
     callId,
@@ -131,8 +132,11 @@ async function handleBrowserSdpOffer(callId, sdpOffer, io) {
 
   // Browser provided SDP offer - forward to WhatsApp
   const result = await whatsappApi.initiateOutboundCall(state.recipientPhone, sdpOffer);
-  state.callId = result.call_id || result.id || callId;
+  // API returns { calls: [{ id: "wacid..." }], success: true }
+  const waCallId = result.calls?.[0]?.id || result.call_id || result.id || callId;
+  state.callId = waCallId;
   state.status = 'ringing';
+  console.log(`[CallManager] WhatsApp call ID mapped: ${callId} -> ${waCallId}`);
 
   // Update map with new callId if different
   if (state.callId !== callId) {
