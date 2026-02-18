@@ -52,7 +52,7 @@ function handlePermissionGranted(phone, io) {
   });
 }
 
-async function startOutboundCall(phone, io) {
+async function startOutboundCall(phone, io, socket) {
   // Check permission
   const permStatus = getPermissionStatus(phone);
   if (!permStatus.granted) {
@@ -63,10 +63,17 @@ async function startOutboundCall(phone, io) {
     );
   }
 
+  // Block if there's already an active outbound call
+  for (const [id, s] of calls) {
+    if (s.direction === 'outbound' && ['awaiting_browser_sdp', 'ringing', 'accepted', 'connected'].includes(s.status)) {
+      throw new Error(`An outbound call is already in progress (${id}, status: ${s.status})`);
+    }
+  }
+
   if (webrtcBridge.isAvailable()) {
     return startOutboundCallWithServerWebRTC(phone, io);
   } else {
-    return startOutboundCallBrowserOnly(phone, io);
+    return startOutboundCallBrowserOnly(phone, io, socket);
   }
 }
 
@@ -100,8 +107,7 @@ async function startOutboundCallWithServerWebRTC(phone, io) {
   return { callId, status: 'ringing' };
 }
 
-async function startOutboundCallBrowserOnly(phone, io) {
-  // In browser-only mode, we signal the browser to create the SDP offer
+async function startOutboundCallBrowserOnly(phone, io, socket) {
   const callId = `call_${Date.now()}`;
 
   const state = {
@@ -109,6 +115,7 @@ async function startOutboundCallBrowserOnly(phone, io) {
     direction: 'outbound',
     recipientPhone: phone,
     status: 'awaiting_browser_sdp',
+    socketId: socket?.id || null,
     whatsappPeer: null,
     browserPeer: null,
     createdAt: new Date()
@@ -116,9 +123,13 @@ async function startOutboundCallBrowserOnly(phone, io) {
 
   calls.set(callId, state);
 
-  // Ask browser to generate SDP offer
-  io.emit('generate-sdp-offer', { callId, phone });
-  console.log(`[CallManager] Browser-only mode: waiting for browser SDP for call ${callId}`);
+  // Send ONLY to the socket that initiated the call, not all clients
+  if (socket) {
+    socket.emit('generate-sdp-offer', { callId, phone });
+  } else {
+    io.emit('generate-sdp-offer', { callId, phone });
+  }
+  console.log(`[CallManager] Browser-only mode: waiting for browser SDP for call ${callId} (socket: ${socket?.id || 'broadcast'})`);
 
   return { callId, status: 'awaiting_browser_sdp', mode: 'browser-only' };
 }
@@ -181,18 +192,26 @@ async function handleOutboundSdpAnswer(callId, sdpAnswer, io) {
   console.log(`[CallManager] Received SDP answer for outbound call ${callId}`);
   state.status = 'connected';
 
+  // Target SDP events to the specific socket that started the call
+  const targetEmit = state.socketId ? (event, data) => {
+    io.to(state.socketId).emit(event, data);
+  } : (event, data) => {
+    io.emit(event, data);
+  };
+
   if (state.whatsappPeer) {
     // Server WebRTC mode - set remote description
     await webrtcBridge.setRemoteAnswer(state.whatsappPeer, sdpAnswer);
     console.log(`[CallManager] WebRTC connected to WhatsApp for call ${callId}`);
 
     // Signal browser to set up audio
-    io.emit('setup-browser-audio', { callId });
+    targetEmit('setup-browser-audio', { callId });
   } else {
     // Browser-only mode - forward SDP answer to browser
-    io.emit('sdp-answer-from-whatsapp', { callId, sdp: sdpAnswer });
+    targetEmit('sdp-answer-from-whatsapp', { callId, sdp: sdpAnswer });
   }
 
+  // Broadcast call-connected to all clients (status update)
   io.emit('call-connected', { callId, phone: state.recipientPhone });
 }
 
@@ -201,7 +220,7 @@ function handleOutboundStatus(callId, statusValue, io) {
 
   // Fallback: search by active outbound call
   if (!state) {
-    for (const [id, s] of calls) {
+    for (const [, s] of calls) {
       if (s.direction === 'outbound' && ['ringing', 'accepted', 'awaiting_browser_sdp'].includes(s.status)) {
         state = s;
         break;
@@ -254,15 +273,14 @@ async function handleInboundCall(callId, from, sdpOffer, io) {
   io.emit('call-incoming', { callId, from, timestamp: new Date().toISOString() });
 }
 
-async function acceptInboundCall(callId, io) {
+async function acceptInboundCall(callId, io, socket) {
   const state = calls.get(callId);
   if (!state || state.direction !== 'inbound') {
     throw new Error('No inbound call to accept');
   }
 
-  // Step 1: Send pre_accept
-  await whatsappApi.answerCall(callId, 'pre_accept');
-  state.status = 'pre_accepted';
+  state.status = 'accepting';
+  const emit = socket ? socket.emit.bind(socket) : io.emit.bind(io);
 
   if (webrtcBridge.isAvailable()) {
     // Server WebRTC mode
@@ -273,15 +291,20 @@ async function acceptInboundCall(callId, io) {
     let sdpAnswer = await webrtcBridge.createAnswerSdp(whatsappPeer, state.whatsappSdpOffer);
     sdpAnswer = webrtcBridge.filterSdpForWhatsApp(sdpAnswer);
 
+    // Step 1: Send pre_accept with SDP answer
+    await whatsappApi.answerCall(callId, 'pre_accept', sdpAnswer);
+    state.status = 'pre_accepted';
+
     // Step 2: Send accept with SDP answer
     await whatsappApi.answerCall(callId, 'accept', sdpAnswer);
     state.status = 'connected';
 
-    io.emit('setup-browser-audio', { callId });
+    emit('setup-browser-audio', { callId });
     io.emit('call-connected', { callId, phone: state.recipientPhone });
   } else {
-    // Browser-only mode - forward SDP offer to browser
-    io.emit('inbound-sdp-offer', { callId, sdp: state.whatsappSdpOffer });
+    // Browser-only mode - forward SDP offer to browser for SDP answer generation
+    // Browser will generate the answer, then handleBrowserSdpAnswer will send pre_accept + accept
+    emit('inbound-sdp-offer', { callId, sdp: state.whatsappSdpOffer });
   }
 }
 
@@ -292,12 +315,20 @@ async function handleBrowserSdpAnswer(callId, sdpAnswer, io) {
   if (state.direction === 'inbound' && !webrtcBridge.isAvailable()) {
     // Browser-only mode: browser generated answer for inbound call
     const filteredSdp = webrtcBridge.filterSdpForWhatsApp(sdpAnswer);
+
+    // Step 1: pre_accept with SDP answer (establishes media connection)
+    await whatsappApi.answerCall(callId, 'pre_accept', filteredSdp);
+    state.status = 'pre_accepted';
+    console.log(`[CallManager] Inbound call ${callId} pre_accepted`);
+
+    // Step 2: accept with SDP answer (formally answers the call)
     await whatsappApi.answerCall(callId, 'accept', filteredSdp);
     state.status = 'connected';
+    console.log(`[CallManager] Inbound call ${callId} accepted and connected`);
+
     io.emit('call-connected', { callId, phone: state.recipientPhone });
   } else if (state.whatsappPeer) {
     // Server mode: browser answer for the browser-facing peer connection
-    // This is the SDP exchange between server and browser
     const browserPeer = state.browserPeer;
     if (browserPeer) {
       await webrtcBridge.setRemoteAnswer(browserPeer, sdpAnswer);
@@ -314,6 +345,23 @@ function handleTerminate(callId, io) {
 
   console.log(`[CallManager] Call ${callId} terminated`);
   state.status = 'terminated';
+  io.emit('call-ended', { callId, phone: state.recipientPhone });
+  cleanup(callId);
+}
+
+async function rejectInboundCall(callId, io) {
+  const state = calls.get(callId);
+  if (!state || state.direction !== 'inbound') {
+    throw new Error('No inbound call to reject');
+  }
+
+  try {
+    await whatsappApi.rejectCall(callId);
+  } catch (e) {
+    console.warn(`[CallManager] Error rejecting call: ${e.message}`);
+  }
+
+  state.status = 'rejected';
   io.emit('call-ended', { callId, phone: state.recipientPhone });
   cleanup(callId);
 }
@@ -359,6 +407,7 @@ module.exports = {
   handleOutboundStatus,
   handleInboundCall,
   acceptInboundCall,
+  rejectInboundCall,
   handleBrowserSdpAnswer,
   handleTerminate,
   endCall

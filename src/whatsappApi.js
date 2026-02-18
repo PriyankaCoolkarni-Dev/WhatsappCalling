@@ -82,7 +82,7 @@ async function answerCall(callId, action, sdpAnswer = null) {
     action: action // 'pre_accept' or 'accept'
   };
 
-  if (action === 'accept' && sdpAnswer) {
+  if (sdpAnswer && (action === 'pre_accept' || action === 'accept')) {
     body.session = {
       sdp: sdpAnswer,
       sdp_type: 'answer'
@@ -92,6 +92,20 @@ async function answerCall(callId, action, sdpAnswer = null) {
   console.log(`[API] Answering call ${callId} with action=${action}...`);
   const res = await api.post(url, body);
   console.log('[API] Answer call response:', res.data);
+  return res.data;
+}
+
+async function rejectCall(callId) {
+  const url = `/${config.PHONE_NUMBER_ID}/calls`;
+  const body = {
+    messaging_product: 'whatsapp',
+    call_id: callId,
+    action: 'reject'
+  };
+
+  console.log(`[API] Rejecting call ${callId}...`);
+  const res = await api.post(url, body);
+  console.log('[API] Reject call response:', res.data);
   return res.data;
 }
 
@@ -129,6 +143,7 @@ module.exports = {
   sendCallPermissionRequest,
   initiateOutboundCall,
   answerCall,
+  rejectCall,
   terminateCall,
   sendTextMessage
 };

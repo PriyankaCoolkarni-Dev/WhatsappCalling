@@ -44,6 +44,7 @@ socket.on('call-connected', (data) => {
   log(`Call ${data.callId} connected!`, 'event');
   showStatus('callStatus', 'Call connected - audio active', 'active');
   document.getElementById('callControls').style.display = 'flex';
+  document.getElementById('inboundCard').style.display = 'none';
   startCallTimer();
 });
 
@@ -56,6 +57,7 @@ socket.on('call-rejected', (data) => {
 socket.on('call-ended', (data) => {
   log(`Call ${data.callId} ended`, 'event');
   showStatus('callStatus', 'Call ended', 'info');
+  document.getElementById('inboundCard').style.display = 'none';
   cleanupCall();
 });
 
@@ -65,6 +67,18 @@ socket.on('call-incoming', (data) => {
   document.getElementById('inboundCard').style.display = 'block';
   document.getElementById('inboundInfo').innerHTML =
     `<div class="status-bar warning">Incoming call from <strong>${data.from}</strong></div>`;
+  // Play a simple ringtone beep to get attention
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 440;
+    gain.gain.value = 0.3;
+    osc.start();
+    osc.stop(ctx.currentTime + 0.5);
+  } catch (e) { /* ignore audio context errors */ }
 });
 
 socket.on('call-status', (data) => {
@@ -381,26 +395,20 @@ async function endCall() {
   cleanupCall();
 }
 
-async function acceptInboundCall() {
+function acceptInboundCall() {
   if (!currentCallId) return;
   log(`Accepting call ${currentCallId}...`, 'api');
-
-  try {
-    await fetch('/api/accept-call', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callId: currentCallId })
-    });
-    document.getElementById('inboundCard').style.display = 'none';
-  } catch (err) {
-    log(`Accept call error: ${err.message}`, 'error');
-  }
+  showStatus('callStatus', 'Accepting incoming call...', 'info');
+  socket.emit('accept-call', { callId: currentCallId });
+  document.getElementById('inboundCard').style.display = 'none';
 }
 
 function rejectInboundCall() {
   if (!currentCallId) return;
-  endCall();
+  log(`Rejecting call ${currentCallId}...`, 'api');
+  socket.emit('reject-call', { callId: currentCallId });
   document.getElementById('inboundCard').style.display = 'none';
+  cleanupCall();
 }
 
 async function sendMessage() {
