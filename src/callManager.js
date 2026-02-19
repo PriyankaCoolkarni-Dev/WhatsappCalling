@@ -63,9 +63,17 @@ async function startOutboundCall(phone, io, socket) {
     );
   }
 
-  // Block if there's already an active outbound call
+  // Block if there's already an active outbound call (auto-expire stale ones)
+  const STALE_TIMEOUT = 30 * 1000; // 30 seconds
   for (const [id, s] of calls) {
     if (s.direction === 'outbound' && ['awaiting_browser_sdp', 'ringing', 'accepted', 'connected'].includes(s.status)) {
+      const age = Date.now() - new Date(s.createdAt).getTime();
+      if (s.status === 'awaiting_browser_sdp' && age > STALE_TIMEOUT) {
+        console.log(`[CallManager] Auto-expiring stale call ${id} (stuck in ${s.status} for ${Math.round(age/1000)}s)`);
+        s.status = 'expired';
+        cleanup(id);
+        continue;
+      }
       throw new Error(`An outbound call is already in progress (${id}, status: ${s.status})`);
     }
   }
@@ -147,22 +155,31 @@ async function handleBrowserSdpOffer(callId, sdpOffer, io) {
     return;
   }
 
-  // Browser provided SDP offer - forward to WhatsApp
-  const result = await whatsappApi.initiateOutboundCall(state.recipientPhone, sdpOffer);
-  // API returns { calls: [{ id: "wacid..." }], success: true }
-  const waCallId = result.calls?.[0]?.id || result.call_id || result.id || callId;
-  state.callId = waCallId;
-  state.status = 'ringing';
-  console.log(`[CallManager] WhatsApp call ID mapped: ${callId} -> ${waCallId}`);
+  try {
+    // Browser provided SDP offer - forward to WhatsApp
+    console.log(`[CallManager] Sending SDP offer to WhatsApp API for ${state.recipientPhone}...`);
+    const result = await whatsappApi.initiateOutboundCall(state.recipientPhone, sdpOffer);
+    // API returns { calls: [{ id: "wacid..." }], success: true }
+    const waCallId = result.calls?.[0]?.id || result.call_id || result.id || callId;
+    state.callId = waCallId;
+    state.status = 'ringing';
+    console.log(`[CallManager] WhatsApp call ID mapped: ${callId} -> ${waCallId}`);
 
-  // Update map with new callId if different
-  if (state.callId !== callId) {
-    calls.delete(callId);
-    calls.set(state.callId, state);
+    // Update map with new callId if different
+    if (state.callId !== callId) {
+      calls.delete(callId);
+      calls.set(state.callId, state);
+    }
+
+    io.emit('call-ringing', { callId: state.callId, phone: state.recipientPhone });
+    console.log(`[CallManager] Browser SDP forwarded, call ${state.callId} ringing`);
+  } catch (err) {
+    const errMsg = err.response?.data?.error?.message || err.message;
+    console.error(`[CallManager] WhatsApp API error for call ${callId}: ${errMsg}`, err.response?.data || '');
+    state.status = 'failed';
+    cleanup(callId);
+    io.emit('call-error', { callId, error: errMsg });
   }
-
-  io.emit('call-ringing', { callId: state.callId, phone: state.recipientPhone });
-  console.log(`[CallManager] Browser SDP forwarded, call ${state.callId} ringing`);
 }
 
 async function handleOutboundSdpAnswer(callId, sdpAnswer, io) {
@@ -396,6 +413,20 @@ function cleanup(callId) {
   setTimeout(() => calls.delete(callId), 5 * 60 * 1000);
 }
 
+function resetCalls(io) {
+  let count = 0;
+  for (const [id, s] of calls) {
+    if (['awaiting_browser_sdp', 'ringing', 'accepted', 'incoming'].includes(s.status)) {
+      s.status = 'reset';
+      cleanup(id);
+      count++;
+    }
+  }
+  if (io) io.emit('calls-reset', { count });
+  console.log(`[CallManager] Reset ${count} stuck call(s)`);
+  return count;
+}
+
 module.exports = {
   getCallState,
   getAllCalls,
@@ -410,5 +441,6 @@ module.exports = {
   rejectInboundCall,
   handleBrowserSdpAnswer,
   handleTerminate,
-  endCall
+  endCall,
+  resetCalls
 };

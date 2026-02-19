@@ -5,6 +5,8 @@ let localStream = null;
 let peerConnection = null;
 let callTimer = null;
 let callStartTime = null;
+let callStuckTimeout = null;
+let ringingTimeout = null;
 
 // ── Socket.IO Connection Status ──
 
@@ -30,9 +32,19 @@ socket.on('permission-granted', (data) => {
 });
 
 socket.on('call-ringing', (data) => {
+  clearTimeout(callStuckTimeout);
+  clearTimeout(ringingTimeout);
   log(`Call ${data.callId} ringing at ${data.phone}`, 'event');
   showStatus('callStatus', 'Ringing...', 'warning');
   currentCallId = data.callId;
+  // If no answer within 45s, show "no answer"
+  ringingTimeout = setTimeout(() => {
+    if (currentCallId === data.callId) {
+      showStatus('callStatus', 'No answer. <button onclick="resetCalls()" style="margin-left:8px;padding:4px 12px;cursor:pointer;border-radius:4px;border:1px solid #c00;background:#fff0f0;color:#c00;">Reset</button>', 'error');
+      log('No answer — ringing timed out after 45s', 'error');
+      document.getElementById('btnCall').disabled = false;
+    }
+  }, 45000);
 });
 
 socket.on('call-accepted', (data) => {
@@ -41,6 +53,8 @@ socket.on('call-accepted', (data) => {
 });
 
 socket.on('call-connected', (data) => {
+  clearTimeout(callStuckTimeout);
+  clearTimeout(ringingTimeout);
   log(`Call ${data.callId} connected!`, 'event');
   showStatus('callStatus', 'Call connected - audio active', 'active');
   document.getElementById('callControls').style.display = 'flex';
@@ -180,6 +194,19 @@ socket.on('inbound-sdp-offer', async (data) => {
 
 socket.on('webhook-event', (data) => {
   log(`Webhook: ${data.type} - ${JSON.stringify(data.data).substring(0, 100)}`, 'info');
+});
+
+socket.on('call-error', (data) => {
+  clearTimeout(callStuckTimeout);
+  log(`Call ${data.callId} failed: ${data.error}`, 'error');
+  showStatus('callStatus', `Call failed: ${data.error} <button onclick="resetCalls()" style="margin-left:8px;padding:4px 12px;cursor:pointer;border-radius:4px;border:1px solid #c00;background:#fff0f0;color:#c00;">Reset</button>`, 'error');
+  document.getElementById('btnCall').disabled = false;
+});
+
+socket.on('calls-reset', (data) => {
+  log(`${data.count} stuck call(s) reset`, 'event');
+  showStatus('callStatus', 'Calls reset. You can make a new call.', 'success');
+  document.getElementById('btnCall').disabled = false;
 });
 
 socket.on('error', (data) => {
@@ -367,9 +394,23 @@ async function initiateCall() {
       if (data.data.mode === 'browser-only') {
         showStatus('callStatus', 'Browser-only mode: generating SDP...', 'info');
       }
+      // Start a stuck-call timeout — if no progress in 15s, show reset
+      clearTimeout(callStuckTimeout);
+      callStuckTimeout = setTimeout(() => {
+        if (currentCallId && document.getElementById('btnCall').disabled) {
+          showStatus('callStatus', 'Call appears stuck. <button onclick="resetCalls()" style="margin-left:8px;padding:4px 12px;cursor:pointer;border-radius:4px;border:1px solid #c00;background:#fff0f0;color:#c00;">Reset &amp; Retry</button>', 'error');
+          log('Call stuck — no response from WhatsApp after 15s', 'error');
+        }
+      }, 15000);
     } else {
-      showStatus('callStatus', `Error: ${JSON.stringify(data.error)}`, 'error');
-      log(`Call error: ${JSON.stringify(data.error)}`, 'error');
+      const errMsg = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+      // If stuck call, show reset option
+      if (errMsg.includes('already in progress')) {
+        showStatus('callStatus', `${errMsg} <button onclick="resetCalls()" style="margin-left:8px;padding:2px 10px;cursor:pointer;">Reset &amp; Retry</button>`, 'error');
+      } else {
+        showStatus('callStatus', `Error: ${errMsg}`, 'error');
+      }
+      log(`Call error: ${errMsg}`, 'error');
       document.getElementById('btnCall').disabled = false;
     }
   } catch (err) {
@@ -411,6 +452,20 @@ function rejectInboundCall() {
   cleanupCall();
 }
 
+async function resetCalls() {
+  log('Resetting stuck calls...', 'api');
+  try {
+    const res = await fetch('/api/reset-calls', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      log(`Reset ${data.reset} call(s)`, 'event');
+      cleanupCall();
+    }
+  } catch (err) {
+    log(`Reset error: ${err.message}`, 'error');
+  }
+}
+
 async function sendMessage() {
   const phone = document.getElementById('msgPhone').value.trim();
   const message = document.getElementById('msgText').value.trim();
@@ -441,6 +496,8 @@ async function sendMessage() {
 // ── Helpers ──
 
 function cleanupCall() {
+  clearTimeout(callStuckTimeout);
+  clearTimeout(ringingTimeout);
   if (localStream) {
     localStream.getTracks().forEach(track => track.stop());
     localStream = null;
